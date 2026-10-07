@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { SAMPLE } from "@/lib/sample";
 
 type ThemePreference = "light" | "dark" | "system";
@@ -188,6 +188,8 @@ export default function Home() {
   const clauses = segment(text);
   const ents = entities(text);
   const sel = active ?? clauses.find((c) => /terminat/i.test(c.title))?.id ?? clauses[0]?.id;
+  const selectedClause = clauses.find((c) => c.id === sel) || clauses[0];
+  const translateSeq = useRef(0);
 
   async function load(t: string, n: string) {
     if (segment(t).length === 0) {
@@ -224,6 +226,7 @@ export default function Home() {
   }
 
   async function translate(id: number | undefined, l: string) {
+    const seq = ++translateSeq.current;
     setLang(l);
     if (l === "English" || id === undefined) {
       setTr("");
@@ -249,12 +252,14 @@ export default function Home() {
         body: JSON.stringify({ translate: true, text: c.text, lang: l }),
       });
       const data = await res.json();
+      if (seq !== translateSeq.current) return;
       if (data?.text) {
         setTr(data.text);
       } else if (!fallback) {
         setTr("Translation for this clause needs an LLM API key (see README).");
       }
     } catch {
+      if (seq !== translateSeq.current) return;
       if (!fallback) {
         setTr("Translation for this clause needs an LLM API key (see README).");
       }
@@ -863,35 +868,65 @@ export default function Home() {
                       justifyContent: "space-between",
                       alignItems: "center",
                       flexWrap: "wrap",
-                      gap: "10px",
+                      gap: "12px",
                       marginBottom: "16px",
                     }}
                   >
                     <div>
                       <h3 style={{ margin: "0 0 2px" }}>🌐 Clause Translation</h3>
-                      <span style={{ fontSize: "0.85rem", color: "var(--ink-muted)" }}>
-                        Viewing Clause {sel} ({clauses.find((c) => c.id === sel)?.title || ""}) in {lang}
+                      <span className="clause-view-subtitle" style={{ fontSize: "0.85rem", color: "var(--ink-muted)" }}>
+                        Viewing Clause {selectedClause?.id || sel}{selectedClause?.title ? ` (${selectedClause.title})` : ""} in {lang}
                       </span>
                     </div>
 
-                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                      <label style={{ fontWeight: 600, fontSize: "0.9rem" }}>Target Language:</label>
-                      <select
-                        aria-label="Target translation language"
-                        value={lang}
-                        onChange={(e) => {
-                          const newLang = e.target.value;
-                          setLang(newLang);
-                          translate(sel, newLang);
-                        }}
-                        style={{ padding: "6px 12px", fontWeight: "bold" }}
-                      >
-                        {LANGS.map((l) => (
-                          <option key={l} value={l}>
-                            {l}
-                          </option>
-                        ))}
-                      </select>
+                    <div style={{ display: "flex", alignItems: "center", gap: "16px", flexWrap: "wrap" }}>
+                      {/* Select Clause Dropdown */}
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                        <label htmlFor="clause-select" style={{ fontWeight: 600, fontSize: "0.9rem" }}>
+                          Select Clause:
+                        </label>
+                        <select
+                          id="clause-select"
+                          aria-label="Select Clause"
+                          value={selectedClause?.id || sel}
+                          onChange={(e) => {
+                            const newId = Number(e.target.value);
+                            setActive(newId);
+                            translate(newId, lang);
+                          }}
+                          style={{ padding: "6px 12px", fontWeight: "bold" }}
+                        >
+                          {clauses.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              Clause {c.id}{c.title ? ` (${c.title})` : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* Target Language Dropdown */}
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                        <label htmlFor="target-lang-select" style={{ fontWeight: 600, fontSize: "0.9rem" }}>
+                          Target Language:
+                        </label>
+                        <select
+                          id="target-lang-select"
+                          aria-label="Target translation language"
+                          value={lang}
+                          onChange={(e) => {
+                            const newLang = e.target.value;
+                            setLang(newLang);
+                            translate(selectedClause?.id ?? sel, newLang);
+                          }}
+                          style={{ padding: "6px 12px", fontWeight: "bold" }}
+                        >
+                          {LANGS.map((l) => (
+                            <option key={l} value={l}>
+                              {l}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
                     </div>
                   </div>
 
@@ -906,11 +941,11 @@ export default function Home() {
                       }}
                     >
                       <span style={{ fontSize: "0.85rem", fontWeight: 700, color: "var(--ink-muted)" }}>
-                        ORIGINAL ENGLISH TEXT — CLAUSE {sel}: {clauses.find((c) => c.id === sel)?.title?.toUpperCase() || ""}
+                        ORIGINAL ENGLISH TEXT — CLAUSE {selectedClause?.id || sel}: {selectedClause?.title?.toUpperCase() || ""}
                       </span>
                     </div>
                     <div className="clause-orig-box">
-                      {clauses.find((c) => c.id === sel)?.text || "No clause selected"}
+                      {selectedClause?.text || "No clause selected"}
                     </div>
                   </div>
 
@@ -926,7 +961,7 @@ export default function Home() {
                         }}
                       >
                         <span style={{ fontSize: "0.85rem", fontWeight: 700, color: "var(--accent)" }}>
-                          {lang.toUpperCase()} TRANSLATION — CLAUSE {sel}
+                          {lang.toUpperCase()} TRANSLATION — CLAUSE {selectedClause?.id || sel}{selectedClause?.title ? `: ${selectedClause.title.toUpperCase()}` : ""}
                         </span>
                         <button
                           className="btn alt sm"
