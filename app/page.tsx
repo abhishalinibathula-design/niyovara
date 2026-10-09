@@ -1,8 +1,6 @@
 "use client";
 import { useState, useEffect, useRef } from "react";
 import { SAMPLE } from "@/lib/sample";
-
-type ThemePreference = "light" | "dark" | "system";
 import {
   segment,
   entities,
@@ -11,7 +9,10 @@ import {
   getSectionHeaders,
   getClauseFallbackTranslation,
   SUPPORTED_LANGUAGES,
+  type Clause,
 } from "@/lib/analyze";
+
+type ThemePreference = "light" | "dark" | "system";
 
 const LANGS = SUPPORTED_LANGUAGES;
 const PROCESS = [
@@ -126,20 +127,41 @@ function ThemeSelector({
   );
 }
 
+// Independent per-clause translation state
+interface ClauseTranslationState {
+  selectedLang: string;
+  displayMode: "original" | "translated";
+  activeLang?: string;
+  translatedText?: string;
+  loading: boolean;
+  error?: string;
+}
+
 export default function Home() {
   const [text, setText] = useState("");
   const [name, setName] = useState("");
   const [step, setStep] = useState(-1);
   const [err, setErr] = useState("");
-  const [tab, setTab] = useState("simple");
+  const [tab, setTab] = useState<"simple" | "overview">("simple");
   const [active, setActive] = useState<number | null>(null);
-  const [lang, setLang] = useState("English");
-  const [tr, setTr] = useState("");
+  const [lang, setLang] = useState<string>("English");
   const [q, setQ] = useState("");
   const [chat, setChat] = useState<{ q: string; a: string; src: number[] }[]>([]);
   const [find, setFind] = useState("");
   const [copied, setCopied] = useState(false);
   const [themePref, setThemePref] = useState<ThemePreference>("system");
+  const [isAskOpen, setIsAskOpen] = useState(false);
+  const [isAsking, setIsAsking] = useState(false);
+
+  // Per-clause state management & expansion
+  const [clauseStates, setClauseStates] = useState<Record<number, ClauseTranslationState>>({});
+  const [expandedClauses, setExpandedClauses] = useState<Record<number, boolean>>({});
+  // Cache for translations keyed by `${clauseId}:${targetLanguage}`
+  const [translationCache, setTranslationCache] = useState<Record<string, string>>({});
+  const cacheRef = useRef<Record<string, string>>({});
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const chatBottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const saved =
@@ -167,6 +189,24 @@ export default function Home() {
     return () => mediaQuery.removeEventListener("change", handleSystemChange);
   }, []);
 
+  // Close Ask modal on Escape key
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && isAskOpen) {
+        setIsAskOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isAskOpen]);
+
+  // Auto-scroll chat to bottom
+  useEffect(() => {
+    if (isAskOpen) {
+      chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [chat, isAskOpen, isAsking]);
+
   function applyTheme(pref: ThemePreference) {
     const isDark =
       pref === "dark" ||
@@ -187,9 +227,6 @@ export default function Home() {
 
   const clauses = segment(text);
   const ents = entities(text);
-  const sel = active ?? clauses.find((c) => /terminat/i.test(c.title))?.id ?? clauses[0]?.id;
-  const selectedClause = clauses.find((c) => c.id === sel) || clauses[0];
-  const translateSeq = useRef(0);
 
   async function load(t: string, n: string) {
     if (segment(t).length === 0) {
@@ -204,100 +241,304 @@ export default function Home() {
     setChat([]);
     setActive(null);
     setLang("English");
-    setTr("");
+    setFind("");
+    setClauseStates({});
+    setTranslationCache({});
+    cacheRef.current = {};
+    setExpandedClauses({});
+
     for (let i = 0; i < PROCESS.length; i++) {
       setStep(i);
-      await new Promise((r) => setTimeout(r, 350));
+      await new Promise((r) => setTimeout(r, 320));
     }
     setText(t);
     setStep(-1);
     setTab("simple");
+
+    // Expand the first clause by default for immediate preview
+    const parsed = segment(t);
+    if (parsed.length > 0) {
+      setExpandedClauses({ [parsed[0].id]: true });
+    }
   }
 
   async function onFile(f?: File) {
     if (!f) return;
     if (!f.name.toLowerCase().endsWith(".txt")) {
       setErr(
-        "PDF, DOCX and scanned-image support is planned. For now please upload a .txt file or try the sample demo."
+        "PDF, DOCX and scanned-image support is planned. For now please upload a .txt file or try the demo sample."
       );
       return;
     }
     load(await f.text(), f.name);
   }
 
-  async function translate(id: number | undefined, l: string) {
-    const seq = ++translateSeq.current;
-    setLang(l);
-    if (l === "English" || id === undefined) {
-      setTr("");
-      return;
-    }
+  // Helper to safely get or initialize a clause's independent translation state
+  const getClauseState = (id: number): ClauseTranslationState => {
+    return (
+      clauseStates[id] || {
+        selectedLang: lang !== "English" ? lang : "Telugu",
+        displayMode: "original",
+        loading: false,
+      }
+    );
+  };
+
+  // User changes language dropdown in a clause
+  const handleLanguageChange = (id: number, newLang: string) => {
+    setClauseStates((prev) => {
+      const cur = prev[id] || {
+        selectedLang: newLang,
+        displayMode: "original",
+        loading: false,
+      };
+      return {
+        ...prev,
+        [id]: {
+          ...cur,
+          selectedLang: newLang,
+        },
+      };
+    });
+  };
+
+  // Restore the exact original English text extracted from the document
+  const handleShowOriginal = (id: number) => {
+    setClauseStates((prev) => {
+      const cur = prev[id];
+      if (!cur) return prev;
+      return {
+        ...prev,
+        [id]: {
+          ...cur,
+          displayMode: "original",
+        },
+      };
+    });
+  };
+
+  // Switch back to viewing the existing translation
+  const handleShowTranslated = (id: number) => {
+    setClauseStates((prev) => {
+      const cur = prev[id];
+      if (!cur || !cur.translatedText) return prev;
+      return {
+        ...prev,
+        [id]: {
+          ...cur,
+          displayMode: "translated",
+        },
+      };
+    });
+  };
+
+  // When user clicks Translate on the clause row
+  const handleTranslateClick = (id: number) => {
+    // Expand the clause row so the language selector and content are visible
+    setExpandedClauses((prev) => ({ ...prev, [id]: true }));
+    setClauseStates((prev) => {
+      if (prev[id]) return prev;
+      return {
+        ...prev,
+        [id]: {
+          selectedLang: lang !== "English" ? lang : "Telugu",
+          displayMode: "original",
+          loading: false,
+        },
+      };
+    });
+  };
+
+  // Confirm and apply translation for a clause
+  const handleApplyTranslation = async (id: number, specificLang?: string) => {
+    const currentState = getClauseState(id);
+    const targetLang = specificLang || currentState.selectedLang || (lang !== "English" ? lang : "Telugu");
     const c = clauses.find((x) => x.id === id);
-    if (!c) {
-      setTr("");
+    if (!c) return;
+
+    // Ensure the clause is expanded
+    setExpandedClauses((prev) => ({ ...prev, [id]: true }));
+
+    // If English is selected, revert display to original English
+    if (targetLang === "English") {
+      setClauseStates((prev) => ({
+        ...prev,
+        [id]: {
+          ...getClauseState(id),
+          selectedLang: "English",
+          displayMode: "original",
+          activeLang: "English",
+          loading: false,
+          error: undefined,
+        },
+      }));
       return;
     }
-    const fallback = getClauseFallbackTranslation(c, l);
-    // Render high-fidelity native translation immediately for instant response
-    if (fallback) {
-      setTr(fallback);
-    } else {
-      setTr("Translating…");
+
+    const cacheKey = `${id}:${targetLang}`;
+
+    // 1. Check in-memory translation cache to avoid duplicate API calls
+    if (cacheRef.current[cacheKey]) {
+      const cachedText = cacheRef.current[cacheKey];
+      setClauseStates((prev) => ({
+        ...prev,
+        [id]: {
+          ...getClauseState(id),
+          selectedLang: targetLang,
+          displayMode: "translated",
+          activeLang: targetLang,
+          translatedText: cachedText,
+          loading: false,
+          error: undefined,
+        },
+      }));
+      return;
     }
+
+    // 2. High-fidelity fallback translation dictionary for native Indic languages
+    const fallback = getClauseFallbackTranslation(c, targetLang);
+
+    // Set loading indicator
+    setClauseStates((prev) => ({
+      ...prev,
+      [id]: {
+        ...getClauseState(id),
+        selectedLang: targetLang,
+        displayMode: fallback ? "translated" : prev[id]?.displayMode || "original",
+        activeLang: targetLang,
+        translatedText: fallback || prev[id]?.translatedText,
+        loading: true,
+        error: undefined,
+      },
+    }));
 
     try {
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ translate: true, text: c.text, lang: l }),
+        body: JSON.stringify({ translate: true, text: c.text, lang: targetLang }),
       });
       const data = await res.json();
-      if (seq !== translateSeq.current) return;
       if (data?.text) {
-        setTr(data.text);
-      } else if (!fallback) {
-        setTr("Translation for this clause needs an LLM API key (see README).");
+        cacheRef.current[cacheKey] = data.text;
+        setTranslationCache((prev) => ({ ...prev, [cacheKey]: data.text }));
+        setClauseStates((prev) => ({
+          ...prev,
+          [id]: {
+            ...getClauseState(id),
+            selectedLang: targetLang,
+            displayMode: "translated",
+            activeLang: targetLang,
+            translatedText: data.text,
+            loading: false,
+            error: undefined,
+          },
+        }));
+      } else if (fallback) {
+        cacheRef.current[cacheKey] = fallback;
+        setTranslationCache((prev) => ({ ...prev, [cacheKey]: fallback }));
+        setClauseStates((prev) => ({
+          ...prev,
+          [id]: {
+            ...getClauseState(id),
+            selectedLang: targetLang,
+            displayMode: "translated",
+            activeLang: targetLang,
+            translatedText: fallback,
+            loading: false,
+            error: undefined,
+          },
+        }));
+      } else {
+        setClauseStates((prev) => ({
+          ...prev,
+          [id]: {
+            ...getClauseState(id),
+            selectedLang: targetLang,
+            loading: false,
+            error: "Translation requires an LLM API key. Configure LLM_API_KEY in .env.local.",
+          },
+        }));
       }
     } catch {
-      if (seq !== translateSeq.current) return;
-      if (!fallback) {
-        setTr("Translation for this clause needs an LLM API key (see README).");
+      if (fallback) {
+        cacheRef.current[cacheKey] = fallback;
+        setTranslationCache((prev) => ({ ...prev, [cacheKey]: fallback }));
+        setClauseStates((prev) => ({
+          ...prev,
+          [id]: {
+            ...getClauseState(id),
+            selectedLang: targetLang,
+            displayMode: "translated",
+            activeLang: targetLang,
+            translatedText: fallback,
+            loading: false,
+            error: undefined,
+          },
+        }));
+      } else {
+        setClauseStates((prev) => ({
+          ...prev,
+          [id]: {
+            ...getClauseState(id),
+            selectedLang: targetLang,
+            loading: false,
+            error: "Translation request failed. Please check your connection and try again.",
+          },
+        }));
       }
     }
-  }
+  };
 
   async function ask(queryText?: string) {
     const question = (queryText || q).trim();
-    if (!question) return;
+    if (!question || isAsking) return;
     setQ("");
-    const r = await fetch("/api/ask", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, clauses, lang }),
-    })
-      .then((res) => res.json())
-      .catch(() => ({ answer: "Sorry, something went wrong. Please try again.", sources: [] }));
-    setChat((c) => [...c, { q: question, a: r.answer, src: r.sources }]);
+    setIsAsking(true);
+    try {
+      const r = await fetch("/api/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, clauses, lang }),
+      }).then((res) => res.json());
+
+      setChat((c) => [...c, { q: question, a: r.answer || "No response received.", src: r.sources || [] }]);
+    } catch {
+      setChat((c) => [
+        ...c,
+        { q: question, a: "Sorry, something went wrong. Please check your connection and try again.", src: [] },
+      ]);
+    } finally {
+      setIsAsking(false);
+    }
   }
 
-  // Highlight a clause in the original document and scroll to it smoothly.
+  // Scroll to and highlight a clause in the bottom Original Document section
   const view = (id: number) => {
     setActive(id);
+    setExpandedClauses((prev) => ({ ...prev, [id]: true }));
     setTimeout(() => {
       document.getElementById("c" + id)?.scrollIntoView({ behavior: "smooth", block: "center" });
-    }, 50);
+    }, 60);
   };
 
-  const pick = (id: number) => {
-    setActive(id);
-    if (tab === "translate") translate(id, lang);
+  const toggleClauseExpanded = (id: number) => {
+    setExpandedClauses((prev) => ({
+      ...prev,
+      [id]: !prev[id],
+    }));
   };
 
-  const hit = (c: { title: string; text: string }) =>
-    find && (c.title + c.text).toLowerCase().includes(find.toLowerCase());
+  const hit = (c: Clause) =>
+    Boolean(find && (c.title + " " + c.text).toLowerCase().includes(find.toLowerCase()));
 
   const Ref = ({ id }: { id: number }) => (
-    <button className="ref-pill" onClick={() => view(id)} title={`Jump to Clause ${id}`}>
+    <button
+      type="button"
+      className="ref-pill"
+      onClick={() => view(id)}
+      title={`Jump to Clause ${id} in Original Document`}
+    >
       Clause {id} ↗
     </button>
   );
@@ -310,26 +551,237 @@ export default function Home() {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const headers = getSectionHeaders(lang);
+
+  // App Header
+  const renderHeader = () => (
+    <header className="bar">
+      {/* Left side: Niyovara Logo and Dashboard button */}
+      <div className="bar-left">
+        <div className="bar-brand">
+          <span className="bar-logo">⚖️ Niyovara</span>
+        </div>
+        <button
+          type="button"
+          className="bar-btn bar-dashboard-btn"
+          onClick={() => {
+            if (!text) {
+              load(SAMPLE, "Sample Service Agreement (fictional).txt");
+            } else {
+              window.scrollTo({ top: 0, behavior: "smooth" });
+            }
+          }}
+          title="Document Dashboard"
+        >
+          <span className="bar-btn-icon">📊</span>
+          <span>Dashboard</span>
+        </button>
+      </div>
+
+      {/* Right side in exact order: Upload New Document -> Light / Dark / System -> Ask Niyovara */}
+      <div className="bar-right">
+        <button
+          type="button"
+          className="bar-btn bar-upload-btn"
+          onClick={() => {
+            if (text) {
+              setText("");
+              setStep(-1);
+            } else {
+              fileInputRef.current?.click();
+            }
+          }}
+          title="Upload New Document"
+        >
+          <span className="bar-btn-icon">📁</span>
+          <span>Upload New Document</span>
+        </button>
+
+        <ThemeSelector themePref={themePref} onThemeChange={handleThemeChange} />
+
+        <button
+          type="button"
+          className={"bar-btn bar-ask-btn" + (isAskOpen ? " active" : "")}
+          onClick={() => {
+            if (!text) {
+              load(SAMPLE, "Sample Service Agreement (fictional).txt").then(() => {
+                setIsAskOpen(true);
+              });
+            } else {
+              setIsAskOpen((prev) => !prev);
+            }
+          }}
+          title={isAskOpen ? "Close Ask Niyovara panel" : "Ask Niyovara"}
+          aria-label="Ask Niyovara"
+          aria-expanded={isAskOpen}
+        >
+          <span className="bar-btn-icon">💬</span>
+          <span>Ask Niyovara</span>
+        </button>
+      </div>
+    </header>
+  );
+
+  // Ask Niyovara Right-Side Panel
+  const renderAskPanel = () => {
+    return (
+      <aside
+        className="ask-side-panel"
+        aria-label="Ask Niyovara Legal Assistant Panel"
+      >
+        <div className="ask-panel-header">
+          <div className="ask-panel-title-group">
+            <span className="ask-panel-logo-icon">💬</span>
+            <div>
+              <h3 className="ask-panel-heading">Ask Niyovara</h3>
+              <p className="ask-panel-subtitle">
+                Grounded legal Q&A in {lang}. Answers cite verified source clauses.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="ask-panel-close-btn"
+            onClick={() => setIsAskOpen(false)}
+            title="Close Ask Niyovara panel"
+            aria-label="Close Ask Niyovara panel"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div className="ask-panel-body">
+          {/* Suggested Questions Section */}
+          <div className="ask-suggestions-box">
+            <div className="ask-suggestions-header">
+              <span>💡 Suggested questions:</span>
+            </div>
+            <div className="ask-suggestions-list">
+              {(MULTILINGUAL_SUGGESTIONS[lang] || MULTILINGUAL_SUGGESTIONS.English).map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  className="suggestion-chip"
+                  onClick={() => ask(s)}
+                >
+                  💬 {s}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Conversation History */}
+          <div className="ask-chat-thread">
+            {chat.length === 0 && (
+              <div className="ask-empty-state">
+                <span className="ask-empty-icon">⚖️</span>
+                <div className="ask-empty-title">Ask any question about this document in {lang}.</div>
+                <p className="ask-empty-desc">
+                  Every answer is strictly grounded in the document clauses with clickable source citations.
+                </p>
+              </div>
+            )}
+
+            {chat.map((m, i) => (
+              <div key={i} className="chat-pair">
+                <div className="chat-msg chat-q">
+                  <b>Q:</b> {m.q}
+                </div>
+                <div className="chat-msg chat-a">
+                  <div className="chat-a-header">
+                    <span>⚖️ Niyovara:</span>
+                  </div>
+                  <p style={{ margin: "0 0 8px", whiteSpace: "pre-wrap", lineHeight: 1.6 }}>{m.a}</p>
+                  {m.src.length > 0 ? (
+                    <div className="chat-sources-bar">
+                      <b>Verified Sources: </b>
+                      {m.src.map((id) => (
+                        <button
+                          key={id}
+                          type="button"
+                          className="ref-pill"
+                          onClick={() => view(id)}
+                          title={`Scroll to Clause ${id} in document`}
+                        >
+                          Clause {id} ↗
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <span className="warn" style={{ display: "inline-block", padding: "4px 8px", fontSize: "0.8rem" }}>
+                      {headers.noSource}
+                    </span>
+                  )}
+                </div>
+              </div>
+            ))}
+
+            {isAsking && (
+              <div className="chat-msg chat-a">
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <span className="spinner-sm" />
+                  <span style={{ fontSize: "0.88rem", color: "var(--ink-secondary)" }}>
+                    Retrieving relevant clauses and formulating answer…
+                  </span>
+                </div>
+              </div>
+            )}
+            <div ref={chatBottomRef} />
+          </div>
+        </div>
+
+        {/* Panel Footer: Input & Send Button */}
+        <div className="ask-panel-footer">
+          <input
+            className="ask-panel-input"
+            placeholder={headers.askPlaceholder}
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                ask();
+              }
+            }}
+            disabled={isAsking}
+            aria-label="Ask a legal question"
+          />
+          <button
+            type="button"
+            className="ask-panel-send-btn"
+            onClick={() => ask()}
+            disabled={isAsking || !q.trim()}
+          >
+            <span>Ask AI</span> ➔
+          </button>
+        </div>
+      </aside>
+    );
+  };
+
   // ==========================================
-  // VIEW 1: UPLOAD / HERO SCREEN
+  // VIEW 1: HERO / UPLOAD SCREEN
   // ==========================================
   if (!text) {
     return (
       <>
-        <div className="bar">
-          <div className="bar-brand">
-            <span className="bar-logo">⚖️ Niyovara</span>
-            <span className="bar-badge">🇮🇳 8 Indian Languages</span>
-          </div>
-          <ThemeSelector themePref={themePref} onThemeChange={handleThemeChange} />
-        </div>
+        {renderHeader()}
 
-        <div className="wrap">
-          {/* Hero Welcome Section */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          hidden
+          accept=".txt,.pdf,.docx,image/*"
+          onChange={(e) => onFile(e.target.files?.[0])}
+        />
+
+        <div className={"app-layout" + (isAskOpen ? " with-ask-panel" : "")}>
+          <div className="main-content-area">
+            <div className="wrap">
+              {/* Hero Welcome Section */}
           <div className="hero-wrapper">
             <div className="hero-aura-bg" />
             <div className="hero-content">
-              {/* 3 Core Highlights Badges */}
               <div className="hero-highlights-row">
                 <span className="hero-highlight-pill hl-languages">
                   🇮🇳 8 Indian Languages
@@ -342,7 +794,6 @@ export default function Home() {
                 </span>
               </div>
 
-              {/* Headline & Tagline */}
               <h1 className="hero-title-main">
                 Understand Legal Documents.{" "}
                 <span className="hero-gradient-text">In Your Language.</span>
@@ -496,7 +947,6 @@ export default function Home() {
             </div>
 
             <div className="features-quad-grid">
-              {/* Feature 1: Understand */}
               <div className="feature-box f-understand card">
                 <div>
                   <div className="feature-icon-circle">💡</div>
@@ -508,7 +958,6 @@ export default function Home() {
                 <span className="feature-badge-pill">Plain-Language Summaries</span>
               </div>
 
-              {/* Feature 2: Translate */}
               <div className="feature-box f-translate card">
                 <div>
                   <div className="feature-icon-circle">🌐</div>
@@ -520,7 +969,6 @@ export default function Home() {
                 <span className="feature-badge-pill">8 Indian Languages</span>
               </div>
 
-              {/* Feature 3: Ask AI */}
               <div className="feature-box f-ask card">
                 <div>
                   <div className="feature-icon-circle">💬</div>
@@ -532,7 +980,6 @@ export default function Home() {
                 <span className="feature-badge-pill">Grounded Legal Q&A</span>
               </div>
 
-              {/* Feature 4: Verify */}
               <div className="feature-box f-verify card">
                 <div>
                   <div className="feature-icon-circle">🛡️</div>
@@ -549,6 +996,9 @@ export default function Home() {
           <div className="warn" style={{ marginTop: "28px" }}>
             🛡️ <b>Notice:</b> {DISC}
           </div>
+            </div>
+          </div>
+          {isAskOpen && renderAskPanel()}
         </div>
       </>
     );
@@ -557,192 +1007,104 @@ export default function Home() {
   // ==========================================
   // VIEW 2: DOCUMENT DASHBOARD VIEW
   // ==========================================
-  const headers = getSectionHeaders(lang);
-
   return (
     <>
-      <div className="bar">
-        <div className="bar-brand">
-          <span className="bar-logo">⚖️ Niyovara</span>
-          <span className="bar-badge">Dashboard</span>
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
-          <button
-            className="bar-btn"
-            onClick={() => {
-              setText("");
-              setStep(-1);
-            }}
-          >
-            <span>← Upload New Document</span>
-          </button>
-          <ThemeSelector themePref={themePref} onThemeChange={handleThemeChange} />
-        </div>
-      </div>
+      {renderHeader()}
 
-      <div className="wrap">
-        {/* Top Header Card */}
-        <div className="card dashboard-top-card">
-          <div style={{ flex: "1 1 320px" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-              <h3 style={{ margin: 0, display: "inline-flex", alignItems: "center", gap: "6px" }}>
-                📄 {name}
-              </h3>
-              <span className="chip l">
-                ⚖️ {clauses.length} {clauses.length === 1 ? "Clause" : "Clauses"}
-              </span>
-              <span className="chip d">🟢 Analyzed</span>
-            </div>
-            {text.split("\n")[0].includes("SAMPLE") && (
-              <p
-                style={{
-                  margin: "6px 0 0",
-                  color: "var(--gold)",
-                  fontWeight: 600,
-                  fontSize: "0.85rem",
-                }}
-              >
-                ⚠️ FICTIONAL SAMPLE DOCUMENT — FOR DEMO PURPOSES ONLY
-              </p>
-            )}
-          </div>
+      <input
+        ref={fileInputRef}
+        type="file"
+        hidden
+        accept=".txt,.pdf,.docx,image/*"
+        onChange={(e) => onFile(e.target.files?.[0])}
+      />
 
-          {/* Global Language Selector */}
-          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-            <label
-              htmlFor="global-lang-select"
-              style={{ fontWeight: 700, fontSize: "0.92rem", color: "var(--ink-secondary)" }}
-            >
-              🌐 Language / భాష:
-            </label>
-            <select
-              id="global-lang-select"
-              aria-label="Language selector"
-              value={lang}
-              onChange={(e) => {
-                const newLang = e.target.value;
-                setLang(newLang);
-                translate(sel, newLang);
-              }}
-              style={{
-                padding: "8px 14px",
-                fontWeight: 700,
-                borderColor: "var(--accent)",
-                boxShadow: "var(--shadow-sm)",
-              }}
-            >
-              {LANGS.map((l) => (
-                <option key={l} value={l}>
-                  {l}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {/* Live Document Search Bar */}
-          <div style={{ width: "100%", marginTop: "4px" }}>
-            <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
-              <span
-                style={{
-                  position: "absolute",
-                  left: "14px",
-                  color: "var(--ink-muted)",
-                  fontSize: "1rem",
-                }}
-              >
-                🔍
-              </span>
-              <input
-                aria-label="Search document"
-                placeholder="Search clauses: termination, payment, warranty, liability, penalty..."
-                value={find}
-                onChange={(e) => setFind(e.target.value)}
-                style={{
-                  width: "100%",
-                  paddingLeft: "38px",
-                  background: "var(--input-bg)",
-                }}
-              />
-              {find && (
-                <button
-                  onClick={() => setFind("")}
+      <div className={"app-layout" + (isAskOpen ? " with-ask-panel" : "")}>
+        <div className="main-content-area">
+          <div className="wrap">
+        {/* UPPER SECTION: ANALYSIS & OVERVIEW */}
+        <div className="upper-section">
+          {/* Document Header Card */}
+          <div className="card dashboard-top-card">
+            <div style={{ flex: "1 1 320px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                <h3 style={{ margin: 0, display: "inline-flex", alignItems: "center", gap: "6px" }}>
+                  📄 {name}
+                </h3>
+                <span className="chip l">
+                  ⚖️ {clauses.length} {clauses.length === 1 ? "Clause" : "Clauses"}
+                </span>
+                <span className="chip d">🟢 Analyzed</span>
+              </div>
+              {text.split("\n")[0].includes("SAMPLE") && (
+                <p
                   style={{
-                    position: "absolute",
-                    right: "12px",
-                    background: "none",
-                    border: 0,
-                    cursor: "pointer",
-                    color: "var(--ink-muted)",
-                    fontWeight: 700,
+                    margin: "6px 0 0",
+                    color: "var(--gold)",
+                    fontWeight: 600,
+                    fontSize: "0.85rem",
                   }}
                 >
-                  ✕
-                </button>
+                  ⚠️ FICTIONAL SAMPLE DOCUMENT — FOR DEMO PURPOSES ONLY
+                </p>
               )}
             </div>
-          </div>
-        </div>
 
-        {/* Split Screen Workspace */}
-        <div className="split">
-          {/* Left Column: Original Document Viewer */}
-          <div className="doc-card">
-            <div className="doc-header">
-              <b>📜 Original Document ({clauses.length} Clauses)</b>
-              <span style={{ fontSize: "0.8rem", color: "var(--ink-muted)" }}>
-                Click clause to inspect & translate
-              </span>
-            </div>
-            <div className="doc-body">
-              {clauses.map((c) => (
-                <div
-                  key={c.id}
-                  id={"c" + c.id}
-                  className={
-                    "cl" +
-                    (sel === c.id && (active !== null || tab === "translate") || hit(c)
-                      ? " on"
-                      : "")
-                  }
-                  onClick={() => pick(c.id)}
-                >
-                  <span className="cl-title">
-                    Clause {c.id} — {c.title}
-                  </span>
-                  <div>{c.text || <i style={{ color: "#94a3b8" }}>No body text</i>}</div>
-                </div>
-              ))}
+            {/* Global Language Selector */}
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <label
+                htmlFor="global-lang-select"
+                style={{ fontWeight: 700, fontSize: "0.92rem", color: "var(--ink-secondary)" }}
+              >
+                🌐 Language / భాష:
+              </label>
+              <select
+                id="global-lang-select"
+                aria-label="Global Language Selector"
+                value={lang}
+                onChange={(e) => {
+                  setLang(e.target.value);
+                }}
+                style={{
+                  padding: "8px 14px",
+                  fontWeight: 700,
+                  borderColor: "var(--accent)",
+                  boxShadow: "var(--shadow-sm)",
+                }}
+              >
+                {LANGS.map((l) => (
+                  <option key={l} value={l}>
+                    {l}
+                  </option>
+                ))}
+              </select>
             </div>
           </div>
 
-          {/* Right Column: Analysis Tabs */}
-          <div>
-            {/* Segmented Pill Tabs */}
+          {/* Analysis Section Block with ONLY 2 tabs: Explain Simply & Key Information */}
+          <div className="analysis-section-block">
             <div className="tabs-container">
-              {[
-                ["simple", "💡 Explain simply"],
-                ["overview", "📊 Key information"],
-                ["translate", "🌐 Translate"],
-                ["ask", "💬 Ask Niyovara"],
-              ].map(([k, l]) => (
-                <button
-                  key={k}
-                  className={"tab-btn" + (tab === k ? " on" : "")}
-                  onClick={() => {
-                    setTab(k);
-                    if (k === "translate") translate(sel, lang);
-                  }}
-                >
-                  {l}
-                </button>
-              ))}
+              <button
+                type="button"
+                className={"tab-btn" + (tab === "simple" ? " on" : "")}
+                onClick={() => setTab("simple")}
+              >
+                💡 Explain Simply
+              </button>
+              <button
+                type="button"
+                className={"tab-btn" + (tab === "overview" ? " on" : "")}
+                onClick={() => setTab("overview")}
+              >
+                📊 Key Information
+              </button>
             </div>
 
-            {/* TAB CONTENT CARD */}
-            <div className="card" style={{ minHeight: "480px" }}>
+            <div className="card analysis-card">
               {/* TAB 1: EXPLAIN SIMPLY */}
               {tab === "simple" && (
                 <>
+                  {/* Document Overview */}
                   <div className="summary-callout">
                     <h3 style={{ margin: "0 0 6px", color: "var(--accent)" }}>
                       {headers.title}
@@ -752,6 +1114,7 @@ export default function Home() {
                     </p>
                   </div>
 
+                  {/* Rights and Permissions & Responsibilities and Rules cards */}
                   {([
                     [
                       headers.rights,
@@ -803,7 +1166,7 @@ export default function Home() {
                   <div style={{ marginBottom: "16px" }}>
                     <h3 style={{ margin: "0 0 6px" }}>📊 Extracted Key Information</h3>
                     <p style={{ margin: 0, color: "var(--ink-muted)", fontSize: "0.9rem" }}>
-                      Automatic entity extraction across parties, dates, financials, and legal terms.
+                      Automatic entity extraction across parties, dates, financials, obligations, and legal conditions.
                     </p>
                   </div>
 
@@ -816,11 +1179,14 @@ export default function Home() {
                             className="entity-group-card"
                           >
                             <b style={{ color: "var(--ink-secondary)", display: "block", marginBottom: "6px" }}>
-                              {k === "Parties" && "🏢 Parties & Entities"}
-                              {k === "Dates" && "📅 Dates & Timelines"}
-                              {k === "Money" && "💰 Monetary Amounts"}
+                              {k === "Parties" && "🏢 Parties Involved"}
+                              {k === "Dates" && "📅 Important Dates & Deadlines"}
+                              {k === "Money" && "💰 Payment Amounts"}
                               {k === "Deadlines" && "⏳ Deadlines & Durations"}
                               {k === "Penalties" && "⚠️ Penalties & Forfeitures"}
+                              {k === "Obligations" && "📋 Obligations & Responsibilities"}
+                              {k === "Duration" && "⏱️ Contract Duration"}
+                              {k === "Termination" && "🚪 Termination Conditions"}
                               {k === "Licenses" && "📜 Recognized Licenses"}
                             </b>
                             <div>
@@ -837,6 +1203,12 @@ export default function Home() {
                                       ? "m"
                                       : k === "Licenses"
                                       ? "l"
+                                      : k === "Obligations"
+                                      ? "o"
+                                      : k === "Termination"
+                                      ? "t"
+                                      : k === "Duration"
+                                      ? "u"
                                       : "")
                                   }
                                 >
@@ -853,211 +1225,8 @@ export default function Home() {
                     </p>
                   )}
 
-                  <div className="warn">
+                  <div className="warn" style={{ marginTop: "16px" }}>
                     ⚠️ <b>Verify:</b> Extracted automatically via regex rules. Always verify critical terms against the source document.
-                  </div>
-                </>
-              )}
-
-              {/* TAB 3: TRANSLATE */}
-              {tab === "translate" && (
-                <>
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                      flexWrap: "wrap",
-                      gap: "12px",
-                      marginBottom: "16px",
-                    }}
-                  >
-                    <div>
-                      <h3 style={{ margin: "0 0 2px" }}>🌐 Clause Translation</h3>
-                      <span className="clause-view-subtitle" style={{ fontSize: "0.85rem", color: "var(--ink-muted)" }}>
-                        Viewing Clause {selectedClause?.id || sel}{selectedClause?.title ? ` (${selectedClause.title})` : ""} in {lang}
-                      </span>
-                    </div>
-
-                    <div style={{ display: "flex", alignItems: "center", gap: "16px", flexWrap: "wrap" }}>
-                      {/* Select Clause Dropdown */}
-                      <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                        <label htmlFor="clause-select" style={{ fontWeight: 600, fontSize: "0.9rem" }}>
-                          Select Clause:
-                        </label>
-                        <select
-                          id="clause-select"
-                          aria-label="Select Clause"
-                          value={selectedClause?.id || sel}
-                          onChange={(e) => {
-                            const newId = Number(e.target.value);
-                            setActive(newId);
-                            translate(newId, lang);
-                          }}
-                          style={{ padding: "6px 12px", fontWeight: "bold" }}
-                        >
-                          {clauses.map((c) => (
-                            <option key={c.id} value={c.id}>
-                              Clause {c.id}{c.title ? ` (${c.title})` : ""}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-
-                      {/* Target Language Dropdown */}
-                      <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                        <label htmlFor="target-lang-select" style={{ fontWeight: 600, fontSize: "0.9rem" }}>
-                          Target Language:
-                        </label>
-                        <select
-                          id="target-lang-select"
-                          aria-label="Target translation language"
-                          value={lang}
-                          onChange={(e) => {
-                            const newLang = e.target.value;
-                            setLang(newLang);
-                            translate(selectedClause?.id ?? sel, newLang);
-                          }}
-                          style={{ padding: "6px 12px", fontWeight: "bold" }}
-                        >
-                          {LANGS.map((l) => (
-                            <option key={l} value={l}>
-                              {l}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Original English Box */}
-                  <div style={{ marginBottom: "14px" }}>
-                    <div
-                      style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        marginBottom: "4px",
-                      }}
-                    >
-                      <span style={{ fontSize: "0.85rem", fontWeight: 700, color: "var(--ink-muted)" }}>
-                        ORIGINAL ENGLISH TEXT — CLAUSE {selectedClause?.id || sel}: {selectedClause?.title?.toUpperCase() || ""}
-                      </span>
-                    </div>
-                    <div className="clause-orig-box">
-                      {selectedClause?.text || "No clause selected"}
-                    </div>
-                  </div>
-
-                  {/* Translated Box */}
-                  {lang !== "English" ? (
-                    <div>
-                      <div
-                        style={{
-                          display: "flex",
-                          justifyContent: "space-between",
-                          alignItems: "center",
-                          marginBottom: "4px",
-                        }}
-                      >
-                        <span style={{ fontSize: "0.85rem", fontWeight: 700, color: "var(--accent)" }}>
-                          {lang.toUpperCase()} TRANSLATION — CLAUSE {selectedClause?.id || sel}{selectedClause?.title ? `: ${selectedClause.title.toUpperCase()}` : ""}
-                        </span>
-                        <button
-                          className="btn alt sm"
-                          onClick={() => copyText(tr)}
-                          title="Copy translation"
-                        >
-                          {copied ? "✓ Copied!" : "📋 Copy"}
-                        </button>
-                      </div>
-                      <div className="clause-trans-box">
-                        {tr || "Translating…"}
-                      </div>
-                      <p className="warn" style={{ marginTop: "12px" }}>
-                        ⚠️ Translation confidence: High. Key legal terminology is preserved with English bracket annotations.
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="card" style={{ textAlign: "center", padding: "20px", color: "var(--ink-muted)" }}>
-                      Select a non-English language from the dropdown above to view native Indian translations.
-                    </div>
-                  )}
-
-                  <p style={{ color: "var(--ink-muted)", fontSize: "0.85rem", marginTop: "14px" }}>
-                    💡 <i>Tip: Click any clause in the left document viewer to instantly translate it.</i>
-                  </p>
-                </>
-              )}
-
-              {/* TAB 4: ASK NIYOVARA */}
-              {tab === "ask" && (
-                <>
-                  <div style={{ marginBottom: "12px" }}>
-                    <h3 style={{ margin: "0 0 4px" }}>💬 Ask Niyovara</h3>
-                    <p style={{ margin: 0, color: "var(--ink-muted)", fontSize: "0.88rem" }}>
-                      Grounded legal Q&A. Answers cite verifiable source clause numbers.
-                    </p>
-                  </div>
-
-                  {/* Suggested Question Chips */}
-                  <div className="suggestions">
-                    {(MULTILINGUAL_SUGGESTIONS[lang] || MULTILINGUAL_SUGGESTIONS.English).map((s) => (
-                      <button key={s} className="suggestion-chip" onClick={() => ask(s)}>
-                        💬 {s}
-                      </button>
-                    ))}
-                  </div>
-
-                  {/* Chat Message Thread */}
-                  <div className="chat-box">
-                    {chat.length === 0 && (
-                      <div className="chat-empty-box">
-                        <span style={{ fontSize: "2rem", display: "block", marginBottom: "8px" }}>⚖️</span>
-                        Ask any question about this document in {lang}. Answers are grounded strictly in the text!
-                      </div>
-                    )}
-
-                    {chat.map((m, i) => (
-                      <div key={i} style={{ display: "grid", gap: "8px" }}>
-                        <div className="chat-msg chat-q">
-                          <b>Q: </b> {m.q}
-                        </div>
-                        <div className="chat-msg chat-a">
-                          <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "6px" }}>
-                            <span style={{ fontWeight: 700, color: "var(--accent)" }}>⚖️ Niyovara:</span>
-                          </div>
-                          <p style={{ margin: "0 0 8px", whiteSpace: "pre-wrap", lineHeight: 1.6 }}>{m.a}</p>
-                          {m.src.length > 0 ? (
-                            <div style={{ fontSize: "0.85rem", color: "var(--ink-muted)", borderTop: "1px solid var(--line)", paddingTop: "6px" }}>
-                              <b>Verified Sources: </b>
-                              {m.src.map((id) => (
-                                <Ref key={id} id={id} />
-                              ))}
-                            </div>
-                          ) : (
-                            <span className="warn" style={{ display: "inline-block", padding: "4px 8px" }}>
-                              {headers.noSource}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* Chat Input Field */}
-                  <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
-                    <input
-                      style={{ flex: 1 }}
-                      aria-label="Ask a question"
-                      placeholder={headers.askPlaceholder}
-                      value={q}
-                      onChange={(e) => setQ(e.target.value)}
-                      onKeyDown={(e) => e.key === "Enter" && ask()}
-                    />
-                    <button className="btn" onClick={() => ask()}>
-                      <span>Ask AI</span> ➔
-                    </button>
                   </div>
                 </>
               )}
@@ -1065,9 +1234,288 @@ export default function Home() {
           </div>
         </div>
 
+        {/* BOTTOM SECTION: ORIGINAL DOCUMENT (FULL-WIDTH) */}
+        <div className="bottom-section card original-doc-section">
+          {/* Header row with Title and Clause Count */}
+          <div className="doc-section-header">
+            <div className="doc-section-title-wrap">
+              <h3 style={{ margin: 0, display: "inline-flex", alignItems: "center", gap: "8px" }}>
+                <span>📜 Original Document</span>
+                <span className="chip l">
+                  {clauses.length} {clauses.length === 1 ? "Clause" : "Clauses"}
+                </span>
+              </h3>
+              <p style={{ margin: "4px 0 0", color: "var(--ink-muted)", fontSize: "0.88rem" }}>
+                Verbatim legal text extracted from {name}. Expand clauses to inspect original phrasing, or translate and restore clauses in place.
+              </p>
+            </div>
+
+            {/* Expand / Collapse All Controls */}
+            <div className="doc-expand-controls">
+              <button
+                type="button"
+                className="btn alt sm"
+                onClick={() => {
+                  const allExp: Record<number, boolean> = {};
+                  clauses.forEach((c) => (allExp[c.id] = true));
+                  setExpandedClauses(allExp);
+                }}
+                title="Expand all clauses"
+              >
+                ▼ Expand All
+              </button>
+              <button
+                type="button"
+                className="btn alt sm"
+                onClick={() => setExpandedClauses({})}
+                title="Collapse all clauses"
+              >
+                ▲ Collapse All
+              </button>
+            </div>
+          </div>
+
+          {/* Search Clauses Input Bar */}
+          <div className="clause-search-bar-wrap">
+            <div style={{ position: "relative", display: "flex", alignItems: "center", width: "100%" }}>
+              <span
+                style={{
+                  position: "absolute",
+                  left: "14px",
+                  color: "var(--ink-muted)",
+                  fontSize: "1rem",
+                }}
+              >
+                🔍
+              </span>
+              <input
+                aria-label="Search clauses"
+                placeholder="Search clauses: termination, payment, warranty, liability, penalty..."
+                value={find}
+                onChange={(e) => setFind(e.target.value)}
+                className="clause-search-input"
+              />
+              {find && (
+                <button
+                  type="button"
+                  onClick={() => setFind("")}
+                  className="clause-search-clear-btn"
+                  aria-label="Clear search"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+            {find && (
+              <div style={{ fontSize: "0.85rem", color: "var(--ink-muted)", marginTop: "6px" }}>
+                Found {clauses.filter((c) => hit(c)).length} matching of {clauses.length} clauses
+              </div>
+            )}
+          </div>
+
+          {/* Numbered Clause Rows */}
+          <div className="clauses-list">
+            {clauses.map((c) => {
+              const clauseState = getClauseState(c.id);
+              const isExpanded = !!expandedClauses[c.id];
+              const isHit = hit(c);
+              const isActive = active === c.id;
+
+              const isTranslatedMode =
+                clauseState.displayMode === "translated" && Boolean(clauseState.translatedText);
+              const currentDisplayedText = isTranslatedMode ? clauseState.translatedText! : c.text;
+
+              return (
+                <div
+                  key={c.id}
+                  id={"c" + c.id}
+                  className={
+                    "clause-row-item" +
+                    (isActive ? " active-clause" : "") +
+                    (isHit ? " search-hit" : "")
+                  }
+                >
+                  {/* Row Header Bar */}
+                  <div
+                    className="clause-row-bar"
+                    onClick={() => toggleClauseExpanded(c.id)}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        toggleClauseExpanded(c.id);
+                      }
+                    }}
+                    aria-expanded={isExpanded}
+                  >
+                    <div className="clause-row-title-area">
+                      <span className="clause-row-badge">Clause {c.id}</span>
+                      <span className="clause-row-name">{c.title}</span>
+                      {isTranslatedMode && (
+                        <span className="clause-mini-lang-pill" title={`Translated to ${clauseState.activeLang}`}>
+                          🌐 {clauseState.activeLang}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Exact control order: 🌐 Translate button immediately to left of Expand/Collapse arrow */}
+                    <div className="clause-row-controls">
+                      <button
+                        type="button"
+                        className="clause-translate-btn"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleTranslateClick(c.id);
+                        }}
+                        title={`Translate Clause ${c.id}`}
+                        aria-label={`Translate Clause ${c.id}`}
+                      >
+                        <span>🌐</span>
+                        <span>Translate</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        className="clause-arrow-btn"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleClauseExpanded(c.id);
+                        }}
+                        title={isExpanded ? "Collapse Clause" : "Expand Clause"}
+                        aria-label={isExpanded ? `Collapse Clause ${c.id}` : `Expand Clause ${c.id}`}
+                      >
+                        <span>{isExpanded ? "▲" : "▼"}</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Expanded Content Area with In-Place Text Replacement */}
+                  {isExpanded && (
+                    <div className="clause-row-content">
+                      {/* Translation & Control Toolbar */}
+                      <div className="clause-toolbar">
+                        {/* Status & Display Toggle Area */}
+                        <div className="clause-toolbar-status">
+                          {isTranslatedMode ? (
+                            <div className="clause-mode-indicator translated">
+                              <span className="mode-pill">🌐 {clauseState.activeLang} Translation</span>
+                              <button
+                                type="button"
+                                className="btn-restore-orig"
+                                onClick={() => handleShowOriginal(c.id)}
+                                title="Restore and view original English text"
+                              >
+                                ↩ View Original English
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="clause-mode-indicator original">
+                              <span className="mode-pill">📄 Original English</span>
+                              {clauseState.translatedText && (
+                                <button
+                                  type="button"
+                                  className="btn-view-trans"
+                                  onClick={() => handleShowTranslated(c.id)}
+                                  title={`View ${clauseState.activeLang} translation`}
+                                >
+                                  🌐 View {clauseState.activeLang} Translation
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Language Selection Dropdown & Apply/Translate Button */}
+                        <div className="clause-toolbar-actions">
+                          <div className="clause-lang-picker">
+                            <label htmlFor={`lang-select-${c.id}`} className="clause-lang-label">
+                              🌐 Language:
+                            </label>
+                            <select
+                              id={`lang-select-${c.id}`}
+                              className="clause-lang-dropdown"
+                              value={clauseState.selectedLang}
+                              onChange={(e) => handleLanguageChange(c.id, e.target.value)}
+                              aria-label={`Select translation language for Clause ${c.id}`}
+                            >
+                              {LANGS.map((l) => (
+                                <option key={l} value={l}>
+                                  {l}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              className="btn-apply-trans"
+                              onClick={() => handleApplyTranslation(c.id)}
+                              disabled={clauseState.loading}
+                              title={`Translate Clause ${c.id} into ${clauseState.selectedLang}`}
+                            >
+                              {clauseState.loading ? (
+                                <span className="btn-loading-content">
+                                  <span className="spinner-xs" />
+                                  <span>Translating…</span>
+                                </span>
+                              ) : (
+                                <span>Translate</span>
+                              )}
+                            </button>
+                          </div>
+
+                          <button
+                            type="button"
+                            className="btn-copy-clause"
+                            onClick={() => copyText(currentDisplayedText)}
+                            title="Copy displayed clause text"
+                          >
+                            {copied ? "✓ Copied" : "📋 Copy"}
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* In-place clause text container */}
+                      <div className="clause-text-container">
+                        {clauseState.loading && !clauseState.translatedText ? (
+                          <div className="clause-loading-state">
+                            <span className="spinner-sm" />
+                            <span>Translating clause text into {clauseState.selectedLang}…</span>
+                          </div>
+                        ) : (
+                          <div
+                            className={`clause-display-text ${isTranslatedMode ? "translated" : "original"}`}
+                          >
+                            {currentDisplayedText || <i style={{ color: "var(--ink-muted)" }}>No body text</i>}
+                          </div>
+                        )}
+
+                        {clauseState.error && (
+                          <div className="warn" style={{ marginTop: "10px" }}>
+                            ⚠️ {clauseState.error}
+                          </div>
+                        )}
+
+                        {isTranslatedMode && (
+                          <div className="clause-confidence-flag">
+                            🛡️ <b>Confidence: High.</b> Key legal terminology is preserved with English bracket annotations. Informational only, not legal advice.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Footer */}
         <div className="foot">
           ⚖️ <b>Niyovara</b> — Empowering citizen access to legal justice across India. · {DISC}
         </div>
+          </div>
+        </div>
+        {isAskOpen && renderAskPanel()}
       </div>
     </>
   );

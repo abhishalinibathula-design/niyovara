@@ -73,6 +73,9 @@ export function entities(t: string) {
     Money: f(/(?:US\s*)?(?:\$|Rs\.?|₹|€|£|USD|INR|EUR|GBP)\s*[\d,]+(?:\.\d{2})?/gi),
     Deadlines: f(/\b\d+\s*(?:business\s+|working\s+)?(?:days?|months?|years?|weeks?|hours?)(?:\s+[a-z]+){0,5}\b/gi),
     Penalties: f(/(?:penalty|fine|liquidated damages|liability for damages)\s+(?:of|for|amounting to)?[^.,;\n]*/gi),
+    Obligations: f(/(?:(?:Party [A-Z]|Party|Licensor|Licensee|Client|Vendor|Contractor|Customer)\s+shall\s+[^\n.,;]{5,85})/gi),
+    Duration: f(/(?:expires\s+on\s+[^\n.,;]+|for\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(?:months?|years?)|duration\s+of\s+[^\n.,;]+|term\s+of\s+[^\n.,;]+)/gi),
+    Termination: f(/(?:terminat\w*\s+this\s+Agreement[^\n.,;]*|terminate\s+by\s+giving[^\n.,;]+|written\s+notice\s+of\s+\d+\s+days[^\n.,;]*|on\s+termination[^\n.,;]*)/gi),
     Licenses: f(/(?:Apache License(?:\s+Version\s+[\d.]+)?|GNU (?:Lesser )?General Public License|MIT License|BSD License)/gi),
   };
 }
